@@ -5,6 +5,7 @@ MusicCraft is built on CraftKit and the Rust crates listed in `Cargo.lock`.
 - CraftKit: MIT OR Apache-2.0, <https://github.com/emilio-n8n/craftkit>
 - egui / eframe: MIT OR Apache-2.0
 - serde / serde_json: MIT OR Apache-2.0
+- hound: MIT OR Apache-2.0
 - rfd: MIT
 - tempfile: MIT OR Apache-2.0
 - thiserror: MIT OR Apache-2.0

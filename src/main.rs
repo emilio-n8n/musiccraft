@@ -1,9 +1,10 @@
-//! CraftKit reference application entry point.
+//! MusicCraft application entry point.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
 mod document;
+mod engine;
 
 use craftkit_ui::cli::{self, CliAction};
 use craftkit_ui::{WindowOptions, run_native};
@@ -23,7 +24,7 @@ fn main() -> craftkit_ui::eframe::Result<()> {
                 "{}",
                 cli::help_text(
                     "musiccraft",
-                    "CraftKit demo — notes application and reference implementation"
+                    "MusicCraft — MIDI arrangement, built-in synth and offline WAV mixdown"
                 )
             );
             return Ok(());
@@ -36,7 +37,7 @@ fn main() -> craftkit_ui::eframe::Result<()> {
     };
 
     run_native(WindowOptions::new("MusicCraft"), move |context| {
-        let app = app::DemoApp::new(context, options);
+        let app = app::MusicCraftApp::new(context, options);
         Ok(Box::new(app) as Box<dyn craftkit_ui::eframe::App>)
     })
 }
