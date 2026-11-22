@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "id": "musiccraft",
+  "name": "MusicCraft",
+  "tagline": "MIDI arrangement, built-in synth and offline WAV mixdown",
+  "repo": "emilio-n8n/musiccraft",
+  "publisher": "emilio-n8n",
+  "upstream": null,
+  "bundle_id": "io.github.emilion8n.musiccraft",
+  "msi_publisher": "emilio-n8n",
+  "apple_team": null,
+  "website": "https://github.com/emilio-n8n/musiccraft",
+  "color": "#8b5cf6",
+  "icon": "musiccraft-128.png"
+}
