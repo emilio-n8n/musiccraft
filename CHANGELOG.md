@@ -2,7 +2,7 @@
 
 All notable changes to MusicCraft are documented here.
 
-## [Unreleased] — productisation (future v0.2.0)
+## [0.2.0] - 2026-11-22
 
 ### Added
 
