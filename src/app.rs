@@ -17,8 +17,11 @@ use craftkit_ui::egui::{
 };
 use craftkit_ui::{AppIdentity, AppShell, Tone, dialogs, theme, widgets};
 
-use crate::document::{Document, Instrument, Note, Track};
+use crate::audio::Player;
+use crate::document::{Document, Effect, Instrument, Note, Track};
+use crate::edit;
 use crate::engine;
+use crate::midi;
 
 const FORMAT: &str = "musiccraft";
 const SCHEMA_VERSION: u32 = 1;
@@ -38,9 +41,13 @@ enum Action {
     Open,
     Save,
     SaveAs,
+    ImportMidi,
+    ExportMidi,
     Undo,
     Redo,
     Mixdown,
+    Duplicate,
+    Quantize,
     PlayPause,
     Stop,
     About,
@@ -63,8 +70,10 @@ enum PendingChoice {
 #[derive(Debug, Clone)]
 enum TrackEdit {
     ToggleMute,
+    ToggleSolo,
     SetInstrument(Instrument),
     SetVolume(f32),
+    SetEffect(Effect),
     Rename(String),
     Remove,
 }
@@ -78,6 +87,23 @@ enum NoteEdit {
     Remove,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DragMode {
+    Move,
+    Resize,
+}
+
+type TrackRow = (usize, String, Instrument, f32, bool, bool, Effect, f32);
+
+#[derive(Debug, Clone, Copy)]
+struct NoteDrag {
+    mode: DragMode,
+    note_id: u64,
+    start_x: f32,
+    start_y: f32,
+    original: Note,
+}
+
 /// The MusicCraft application state.
 pub struct MusicCraftApp {
     shell: AppShell,
@@ -86,9 +112,13 @@ pub struct MusicCraftApp {
     selected_note: Option<u64>,
     jobs: JobRunner<PathBuf>,
     pending: Option<PendingAction>,
+    player: Player,
+    realtime: bool,
     playing: bool,
     playhead_beats: f64,
     last_tick: Option<Instant>,
+    drag: Option<NoteDrag>,
+    quantize_grid: f64,
 }
 
 impl MusicCraftApp {
@@ -114,11 +144,26 @@ impl MusicCraftApp {
             selected_note: None,
             jobs: JobRunner::new(),
             pending: None,
+            player: Player::new(),
+            realtime: false,
             playing: false,
             playhead_beats: 0.0,
             last_tick: None,
+            drag: None,
+            quantize_grid: edit::DEFAULT_GRID,
         };
         app.shell.install_theme(&context.egui_ctx);
+        if app.player.is_available() {
+            app.shell.set_status(format!(
+                "Real-time audio: {}",
+                app.player.device_name().unwrap_or("default")
+            ));
+        } else {
+            app.shell.set_status(format!(
+                "Offline preview — {}",
+                app.player.unavailable_reason().unwrap_or("no audio device")
+            ));
+        }
         if let Some(path) = options.open {
             app.load_path(path);
         }
@@ -260,17 +305,46 @@ impl MusicCraftApp {
             self.shell.set_status("Add a note before starting playback");
             return;
         }
-        self.playing = !self.playing;
+        if self.playing {
+            self.playing = false;
+            self.player.pause();
+            self.shell.set_status("Playback paused");
+            return;
+        }
+        if self.realtime && self.player.resume() {
+            self.playing = true;
+            self.last_tick = None;
+            self.shell.set_status("Real-time playback resumed");
+            return;
+        }
+        self.playing = true;
         self.last_tick = None;
-        self.shell.set_status(if self.playing {
-            "Playhead running (silent preview)"
+        if self.player.is_available() {
+            let samples = engine::render(self.host.document());
+            match self.player.play(samples, true) {
+                Ok(()) => {
+                    self.realtime = true;
+                    self.shell.set_status(format!(
+                        "Real-time playback — {}",
+                        self.player.device_name().unwrap_or("default output")
+                    ));
+                }
+                Err(error) => {
+                    self.realtime = false;
+                    self.shell.set_status(format!("Offline preview — {error}"));
+                }
+            }
         } else {
-            "Playhead paused"
-        });
+            self.realtime = false;
+            self.shell
+                .set_status("Offline preview (no audio device) — visual playhead only, no sound");
+        }
     }
 
     fn stop(&mut self) {
         self.playing = false;
+        self.realtime = false;
+        self.player.stop();
         self.playhead_beats = 0.0;
         self.last_tick = None;
     }
@@ -280,17 +354,26 @@ impl MusicCraftApp {
             self.last_tick = None;
             return;
         }
-        let now = Instant::now();
-        let delta = self
-            .last_tick
-            .map_or(0.0, |previous| now.duration_since(previous).as_secs_f64());
-        self.last_tick = Some(now);
         let document = self.host.document();
         let duration = document.duration_beats();
         if duration <= 0.0 {
             self.stop();
             return;
         }
+        if self.realtime && self.player.is_playing() {
+            let seconds = self.player.position_frames() as f64 / f64::from(engine::SAMPLE_RATE);
+            self.playhead_beats = seconds * document.effective_bpm() / 60.0;
+            if self.playhead_beats > duration {
+                self.playhead_beats = 0.0;
+            }
+            ui.ctx().request_repaint();
+            return;
+        }
+        let now = Instant::now();
+        let delta = self
+            .last_tick
+            .map_or(0.0, |previous| now.duration_since(previous).as_secs_f64());
+        self.last_tick = Some(now);
         self.playhead_beats += delta * document.effective_bpm() / 60.0;
         if self.playhead_beats > duration {
             self.playhead_beats = 0.0;
@@ -308,6 +391,8 @@ impl MusicCraftApp {
                 instrument: Instrument::Sine,
                 volume: 0.7,
                 mute: false,
+                solo: false,
+                effect: crate::document::Effect::None,
                 notes: Vec::new(),
             });
         });
@@ -352,10 +437,24 @@ impl MusicCraftApp {
                     }
                 });
             }
+            TrackEdit::ToggleSolo => {
+                self.host.apply(|document| {
+                    if let Some(track) = document.tracks.get_mut(index) {
+                        track.solo = !track.solo;
+                    }
+                });
+            }
             TrackEdit::SetInstrument(instrument) => {
                 self.host.apply(|document| {
                     if let Some(track) = document.tracks.get_mut(index) {
                         track.instrument = instrument;
+                    }
+                });
+            }
+            TrackEdit::SetEffect(effect) => {
+                self.host.apply(|document| {
+                    if let Some(track) = document.tracks.get_mut(index) {
+                        track.effect = effect;
                     }
                 });
             }
@@ -423,6 +522,97 @@ impl MusicCraftApp {
         self.clamp_selection();
     }
 
+    fn import_midi(&mut self) {
+        let Some(path) = dialogs::open_project("Import MIDI", &["mid", "midi"]) else {
+            return;
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.shell
+                    .notify(Tone::Error, "Could not read MIDI", error.to_string());
+                return;
+            }
+        };
+        match midi::import_bytes(&bytes) {
+            Ok(document) => {
+                self.stop();
+                self.host.reset(document);
+                self.selected_track = 0;
+                self.selected_note = None;
+                self.shell
+                    .set_status(format!("Imported MIDI from {}", path.display()));
+            }
+            Err(error) => {
+                self.shell
+                    .notify(Tone::Error, "Could not import MIDI", error.to_string())
+            }
+        }
+    }
+
+    fn export_midi(&mut self) {
+        let document = self.host.document();
+        let bytes = match midi::export_bytes(document) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.shell
+                    .notify(Tone::Error, "Could not export MIDI", error.to_string());
+                return;
+            }
+        };
+        let default_name = format!("{}.mid", slugify(&document.title));
+        let Some(path) = dialogs::save_project("Export MIDI", &default_name, "mid") else {
+            return;
+        };
+        match std::fs::write(&path, bytes) {
+            Ok(()) => self
+                .shell
+                .set_status(format!("Exported MIDI to {}", path.display())),
+            Err(error) => self
+                .shell
+                .notify(Tone::Error, "Could not write MIDI", error.to_string()),
+        }
+    }
+
+    fn duplicate_selected_note(&mut self) {
+        let (track, note) = (self.selected_track, self.selected_note);
+        let Some(note_id) = note else {
+            self.shell.set_status("Select a note to duplicate");
+            return;
+        };
+        let mut new_id = None;
+        self.host.apply(|document| {
+            new_id = edit::duplicate_note(document, track, note_id);
+        });
+        if let Some(id) = new_id {
+            self.selected_note = Some(id);
+            self.shell.set_status("Note duplicated");
+        } else {
+            self.shell.set_status("Could not duplicate note");
+        }
+    }
+
+    fn quantize_selected(&mut self) {
+        let grid = edit::clamp_grid(self.quantize_grid);
+        let track = self.selected_track;
+        let note_id = self.selected_note;
+        let mut changed = 0;
+        self.host.apply(|document| {
+            if let Some(id) = note_id {
+                if let Some(track) = document.tracks.get_mut(track)
+                    && let Some(note) = track.notes.iter_mut().find(|note| note.id == id)
+                {
+                    *note = edit::quantize_note(note, grid);
+                    changed = 1;
+                }
+            } else {
+                changed = edit::quantize_document(document, grid);
+            }
+        });
+        self.shell
+            .set_status(format!("Quantized {changed} note(s) to {grid} beat(s)"));
+    }
+
     fn start_mixdown(&mut self) {
         let document = self.host.document().clone();
         let default_name = format!("{}.wav", slugify(&document.title));
@@ -478,6 +668,8 @@ impl MusicCraftApp {
             Action::SaveAs => {
                 self.save_as();
             }
+            Action::ImportMidi => self.import_midi(),
+            Action::ExportMidi => self.export_midi(),
             Action::Undo => {
                 if self.host.undo() {
                     self.clamp_selection();
@@ -491,6 +683,8 @@ impl MusicCraftApp {
                 }
             }
             Action::Mixdown => self.start_mixdown(),
+            Action::Duplicate => self.duplicate_selected_note(),
+            Action::Quantize => self.quantize_selected(),
             Action::PlayPause => self.toggle_play(),
             Action::Stop => self.stop(),
             Action::About => self.shell.open_about(),
@@ -520,6 +714,10 @@ impl MusicCraftApp {
                 Some(Action::Redo)
             } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Space) {
                 Some(Action::PlayPause)
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::D) {
+                Some(Action::Duplicate)
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Q) {
+                Some(Action::Quantize)
             } else {
                 None
             }
@@ -553,6 +751,14 @@ impl MusicCraftApp {
                     action = Some(Action::SaveAs);
                     ui.close();
                 }
+                if ui.button("Import MIDI...").clicked() {
+                    action = Some(Action::ImportMidi);
+                    ui.close();
+                }
+                if ui.button("Export MIDI...").clicked() {
+                    action = Some(Action::ExportMidi);
+                    ui.close();
+                }
                 if ui.button("Mixdown WAV...").clicked() {
                     action = Some(Action::Mixdown);
                     ui.close();
@@ -571,6 +777,15 @@ impl MusicCraftApp {
                     .clicked()
                 {
                     action = Some(Action::Redo);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Duplicate note (D)").clicked() {
+                    action = Some(Action::Duplicate);
+                    ui.close();
+                }
+                if ui.button("Quantize (Q)").clicked() {
+                    action = Some(Action::Quantize);
                     ui.close();
                 }
             });
@@ -606,7 +821,7 @@ impl MusicCraftApp {
     }
 
     fn track_panel(&mut self, ui: &mut egui::Ui) {
-        let tracks: Vec<(usize, String, Instrument, f32, bool)> = self
+        let tracks: Vec<TrackRow> = self
             .host
             .document()
             .tracks
@@ -619,6 +834,9 @@ impl MusicCraftApp {
                     track.instrument,
                     track.volume,
                     track.mute,
+                    track.solo,
+                    track.effect,
+                    self.host.document().master_volume,
                 )
             })
             .collect();
@@ -636,10 +854,12 @@ impl MusicCraftApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for (index, name, instrument, volume, mute) in &tracks {
+                        for (index, name, instrument, volume, mute, solo, effect, _) in &tracks {
                             ui.group(|ui| {
                                 let label = if *mute {
                                     format!("{name}  (muted)")
+                                } else if *solo {
+                                    format!("{name}  (solo)")
                                 } else {
                                     name.clone()
                                 };
@@ -654,9 +874,7 @@ impl MusicCraftApp {
                                 ComboBox::from_id_salt(format!("instrument-{index}"))
                                     .selected_text(instrument.label())
                                     .show_ui(ui, |ui| {
-                                        for option in
-                                            [Instrument::Sine, Instrument::Square, Instrument::Saw]
-                                        {
+                                        for option in Instrument::all() {
                                             if ui
                                                 .selectable_label(
                                                     *instrument == option,
@@ -671,6 +889,8 @@ impl MusicCraftApp {
                                             }
                                         }
                                     });
+                                effect_selector(ui, effect, *index, &mut actions);
+                                effect_params_ui(ui, effect, *index, &mut actions);
                                 let mut mixer_volume = *volume;
                                 if ui
                                     .add(
@@ -688,6 +908,10 @@ impl MusicCraftApp {
                                     if ui.button(mute_label).clicked() {
                                         actions.push((*index, TrackEdit::ToggleMute));
                                     }
+                                    let solo_label = if *solo { "Unsolo" } else { "Solo" };
+                                    if ui.button(solo_label).clicked() {
+                                        actions.push((*index, TrackEdit::ToggleSolo));
+                                    }
                                     if ui.small_button("Remove").clicked() {
                                         actions.push((*index, TrackEdit::Remove));
                                     }
@@ -695,6 +919,22 @@ impl MusicCraftApp {
                             });
                         }
                     });
+                ui.separator();
+                widgets::section_label(ui, "Master");
+                let mut master = self.host.document().master_volume;
+                if ui
+                    .add(
+                        DragValue::new(&mut master)
+                            .range(0.0..=1.0)
+                            .speed(0.01)
+                            .prefix("Out "),
+                    )
+                    .changed()
+                {
+                    self.host.apply(|document| {
+                        document.master_volume = Track::clamp_volume(master);
+                    });
+                }
                 if ui.button("Add track").clicked() {
                     add_track = true;
                 }
@@ -854,11 +1094,20 @@ impl MusicCraftApp {
         let mut settings = false;
         let mut add_note: Option<(usize, u8, f64)> = None;
         let mut select: Option<(usize, u64)> = None;
+        let mut drag_start: Option<(u64, DragMode, f32, f32, Note)> = None;
+        let mut drag_delta: Option<(f32, f32)> = None;
+        let mut drag_end = false;
+        let mut quantize = false;
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Arrangement");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if widgets::toolbar_button(ui, "Quantize", "Snap notes to the grid (Q)")
+                        .clicked()
+                    {
+                        quantize = true;
+                    }
                     if widgets::toolbar_button(ui, "Mixdown WAV", "Export an offline WAV mix")
                         .clicked()
                     {
@@ -878,10 +1127,15 @@ impl MusicCraftApp {
                     self.stop();
                 }
                 ui.label(format!(
-                    "{:.2} / {:.2} beats · {} notes",
+                    "{:.2} / {:.2} beats · {} notes · {}",
                     self.playhead_beats.min(document.duration_beats()),
                     document.duration_beats(),
-                    document.note_count()
+                    document.note_count(),
+                    if self.realtime {
+                        "audio on"
+                    } else {
+                        "offline preview"
+                    }
                 ));
                 let response = ui.add(
                     DragValue::new(&mut bpm)
@@ -913,7 +1167,7 @@ impl MusicCraftApp {
             egui::ScrollArea::both()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let (rect, response) = ui.allocate_exact_size(content, Sense::click());
+                    let (rect, response) = ui.allocate_exact_size(content, Sense::click_and_drag());
                     let painter = ui.painter_at(rect);
                     let origin = Pos2::new(rect.min.x + LABEL_WIDTH, rect.min.y + RULER_HEIGHT);
 
@@ -1024,6 +1278,40 @@ impl MusicCraftApp {
                             add_note = Some((self.selected_track, pitch, f64::from(beat)));
                         }
                     }
+
+                    if response.drag_started()
+                        && let Some(position) = response.interact_pointer_pos()
+                    {
+                        let mut hit = None;
+                        'drag_search: for (track_index, track) in document.tracks.iter().enumerate()
+                        {
+                            for note in &track.notes {
+                                let rect = note_rect(note, origin);
+                                if rect.contains(position) {
+                                    let mode = if position.x >= rect.max.x - 6.0 {
+                                        DragMode::Resize
+                                    } else {
+                                        DragMode::Move
+                                    };
+                                    hit = Some((track_index, *note, mode));
+                                    break 'drag_search;
+                                }
+                            }
+                        }
+                        if let Some((track_index, note, mode)) = hit {
+                            select = Some((track_index, note.id));
+                            drag_start = Some((note.id, mode, position.x, position.y, note));
+                        }
+                    }
+                    if let Some(position) = response.interact_pointer_pos()
+                        && (response.dragged() || response.drag_stopped())
+                        && self.drag.is_some()
+                    {
+                        drag_delta = Some((position.x, position.y));
+                    }
+                    if response.drag_stopped() {
+                        drag_end = true;
+                    }
                 });
         });
 
@@ -1037,11 +1325,53 @@ impl MusicCraftApp {
             self.selected_track = track_index;
             self.selected_note = Some(id);
         }
+        if let Some((note_id, mode, start_x, start_y, original)) = drag_start {
+            self.drag = Some(NoteDrag {
+                mode,
+                note_id,
+                start_x,
+                start_y,
+                original,
+            });
+            self.host.history_mut().begin_gesture();
+        }
+        if let Some((x, y)) = drag_delta
+            && let Some(drag) = self.drag
+        {
+            let delta_beats = f64::from(x - drag.start_x) / f64::from(BEAT_WIDTH);
+            let delta_pitch = ((drag.start_y - y) / ROW_HEIGHT).round() as i32;
+            let updated = match drag.mode {
+                DragMode::Move => edit::move_note(&drag.original, delta_beats, delta_pitch),
+                DragMode::Resize => {
+                    edit::resize_note(&drag.original, drag.original.length_beats + delta_beats)
+                }
+            };
+            let track_index = self.selected_track;
+            let note_id = drag.note_id;
+            if let Some(note) = self
+                .host
+                .history_mut()
+                .current_mut()
+                .tracks
+                .get_mut(track_index)
+                .and_then(|track| track.notes.iter_mut().find(|note| note.id == note_id))
+            {
+                *note = updated;
+            }
+        }
+        if drag_end && self.drag.is_some() {
+            self.host.history_mut().end_gesture();
+            self.drag = None;
+            self.shell.set_status("Note edit recorded as one undo step");
+        }
         if let Some((track_index, pitch, beat)) = add_note {
             self.add_note(track_index, pitch, beat);
         }
         if mixdown {
             self.start_mixdown();
+        }
+        if quantize {
+            self.quantize_selected();
         }
         if settings {
             self.shell.open_settings();
@@ -1113,11 +1443,139 @@ fn note_rect(note: &Note, origin: Pos2) -> Rect {
     )
 }
 
+fn effect_selector(
+    ui: &mut egui::Ui,
+    effect: &Effect,
+    index: usize,
+    actions: &mut Vec<(usize, TrackEdit)>,
+) {
+    ComboBox::from_id_salt(format!("effect-{index}"))
+        .selected_text(effect.label())
+        .show_ui(ui, |ui| {
+            for option in [
+                Effect::None,
+                Effect::Delay {
+                    time_beats: 0.5,
+                    feedback: 0.35,
+                    mix: 0.25,
+                },
+                Effect::Reverb {
+                    mix: 0.2,
+                    decay: 0.65,
+                },
+            ] {
+                if ui
+                    .selectable_label(effect.label() == option.label(), option.label())
+                    .clicked()
+                {
+                    actions.push((index, TrackEdit::SetEffect(option)));
+                }
+            }
+        });
+}
+
+fn effect_params_ui(
+    ui: &mut egui::Ui,
+    effect: &Effect,
+    index: usize,
+    actions: &mut Vec<(usize, TrackEdit)>,
+) {
+    match *effect {
+        Effect::None => {}
+        Effect::Delay {
+            time_beats,
+            feedback,
+            mix,
+        } => {
+            let mut time = time_beats;
+            let mut feedback_value = feedback;
+            let mut mix_value = mix;
+            ui.horizontal(|ui| {
+                ui.add(DragValue::new(&mut time).range(0.125..=8.0).prefix("T "));
+                if ui
+                    .add(
+                        DragValue::new(&mut feedback_value)
+                            .range(0.0..=0.9)
+                            .prefix("FB "),
+                    )
+                    .changed()
+                {
+                    actions.push((
+                        index,
+                        TrackEdit::SetEffect(Effect::Delay {
+                            time_beats: time,
+                            feedback: feedback_value,
+                            mix: mix_value,
+                        }),
+                    ));
+                }
+                if ui
+                    .add(
+                        DragValue::new(&mut mix_value)
+                            .range(0.0..=1.0)
+                            .prefix("Mix "),
+                    )
+                    .changed()
+                {
+                    actions.push((
+                        index,
+                        TrackEdit::SetEffect(Effect::Delay {
+                            time_beats: time,
+                            feedback: feedback_value,
+                            mix: mix_value,
+                        }),
+                    ));
+                }
+            });
+        }
+        Effect::Reverb { decay, mix } => {
+            let mut decay_value = decay;
+            let mut mix_value = mix;
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        DragValue::new(&mut decay_value)
+                            .range(0.0..=0.95)
+                            .prefix("Decay "),
+                    )
+                    .changed()
+                {
+                    actions.push((
+                        index,
+                        TrackEdit::SetEffect(Effect::Reverb {
+                            decay: decay_value,
+                            mix: mix_value,
+                        }),
+                    ));
+                }
+                if ui
+                    .add(
+                        DragValue::new(&mut mix_value)
+                            .range(0.0..=1.0)
+                            .prefix("Mix "),
+                    )
+                    .changed()
+                {
+                    actions.push((
+                        index,
+                        TrackEdit::SetEffect(Effect::Reverb {
+                            decay: decay_value,
+                            mix: mix_value,
+                        }),
+                    ));
+                }
+            });
+        }
+    }
+}
+
 fn instrument_color(instrument: Instrument) -> Color32 {
     match instrument {
         Instrument::Sine => theme::INFO,
         Instrument::Square => theme::SUCCESS,
         Instrument::Saw => theme::WARNING,
+        Instrument::Triangle => theme::ACCENT_LIGHT,
+        Instrument::Noise => theme::MUTED,
     }
 }
 

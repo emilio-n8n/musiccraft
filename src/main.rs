@@ -3,8 +3,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod audio;
 mod document;
+mod edit;
 mod engine;
+mod midi;
 
 use craftkit_ui::cli::{self, CliAction};
 use craftkit_ui::{WindowOptions, run_native};

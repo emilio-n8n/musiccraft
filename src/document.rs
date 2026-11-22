@@ -23,6 +23,10 @@ pub enum Instrument {
     Square,
     /// Ramp-like sawtooth wave.
     Saw,
+    /// Soft triangular wave.
+    Triangle,
+    /// Deterministic white-noise texture.
+    Noise,
 }
 
 impl Instrument {
@@ -33,6 +37,80 @@ impl Instrument {
             Self::Sine => "Sine",
             Self::Square => "Square",
             Self::Saw => "Saw",
+            Self::Triangle => "Triangle",
+            Self::Noise => "Noise",
+        }
+    }
+
+    /// Stable index used by MIDI program mapping.
+    #[must_use]
+    pub const fn index(self) -> u8 {
+        match self {
+            Self::Sine => 0,
+            Self::Square => 1,
+            Self::Saw => 2,
+            Self::Triangle => 3,
+            Self::Noise => 4,
+        }
+    }
+
+    /// Instrument for a stable index; unknown programs wrap around.
+    #[must_use]
+    pub const fn from_index(index: u8) -> Self {
+        match index % 5 {
+            0 => Self::Sine,
+            1 => Self::Square,
+            2 => Self::Saw,
+            3 => Self::Triangle,
+            _ => Self::Noise,
+        }
+    }
+
+    /// All instruments, in editor display order.
+    #[must_use]
+    pub const fn all() -> [Self; 5] {
+        [
+            Self::Sine,
+            Self::Square,
+            Self::Saw,
+            Self::Triangle,
+            Self::Noise,
+        ]
+    }
+}
+
+/// Simple per-track effect, applied before the track joins the master mix.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub enum Effect {
+    /// No effect.
+    #[default]
+    None,
+    /// Feedback echo; times in beats, levels in `0.0..=1.0`.
+    Delay {
+        /// Delay time in beats.
+        time_beats: f64,
+        /// Feedback amount.
+        feedback: f32,
+        /// Wet level.
+        mix: f32,
+    },
+    /// Short Schroeder-style reverb; levels in `0.0..=1.0`.
+    Reverb {
+        /// Wet level.
+        mix: f32,
+        /// Decay of the comb filters.
+        decay: f32,
+    },
+}
+
+impl Effect {
+    /// Short label used by the mixer.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Delay { .. } => "Delay",
+            Self::Reverb { .. } => "Reverb",
         }
     }
 }
@@ -147,6 +225,13 @@ pub struct Track {
     pub volume: f32,
     /// When muted, the track is skipped by the renderer.
     pub mute: bool,
+    /// When any track is soloed, only soloed tracks are rendered.
+    #[serde(default)]
+    pub solo: bool,
+    /// Simple insert effect. Defaults to none for schema-1 files written by
+    /// earlier versions.
+    #[serde(default)]
+    pub effect: Effect,
     /// Notes belonging to this track.
     pub notes: Vec<Note>,
 }
@@ -161,6 +246,12 @@ impl Track {
             0.0
         }
     }
+
+    /// Whether this track should sound given the global solo state.
+    #[must_use]
+    pub fn is_audible_with(&self, any_solo: bool) -> bool {
+        !self.mute && (!any_solo || self.solo)
+    }
 }
 
 /// A complete, versionable arrangement.
@@ -170,10 +261,17 @@ pub struct Document {
     pub title: String,
     /// Tempo in beats per minute.
     pub bpm: f64,
+    /// Master output level in `0.0..=1.0`.
+    #[serde(default = "default_master_volume")]
+    pub master_volume: f32,
     /// Tracks in display order.
     pub tracks: Vec<Track>,
     /// Next identifier handed out by [`Document::allocate_id`].
     pub next_id: u64,
+}
+
+fn default_master_volume() -> f32 {
+    0.9
 }
 
 impl Default for Document {
@@ -181,6 +279,7 @@ impl Default for Document {
         Self {
             title: "Untitled".into(),
             bpm: DEFAULT_BPM,
+            master_volume: default_master_volume(),
             tracks: Vec::new(),
             next_id: 1,
         }
@@ -215,6 +314,12 @@ impl Document {
             .fold(0.0_f64, |latest, note| latest.max(note.end_beat()))
     }
 
+    /// Whether at least one track is soloed.
+    #[must_use]
+    pub fn has_solo(&self) -> bool {
+        self.tracks.iter().any(|track| track.solo)
+    }
+
     /// Length of the arrangement in seconds at the effective tempo.
     #[must_use]
     pub fn duration_seconds(&self) -> f64 {
@@ -233,6 +338,7 @@ impl Document {
         let mut document = Self {
             title: "MusicCraft demo".into(),
             bpm: DEFAULT_BPM,
+            master_volume: default_master_volume(),
             tracks: Vec::with_capacity(3),
             next_id: 1,
         };
@@ -299,6 +405,8 @@ fn add_track(
         instrument,
         volume,
         mute: false,
+        solo: false,
+        effect: Effect::None,
         notes,
     });
 }
@@ -313,12 +421,15 @@ mod tests {
         Document {
             title: "Test".into(),
             bpm: 120.0,
+            master_volume: 0.9,
             tracks: vec![Track {
                 id: 1,
                 name: "Lead".into(),
                 instrument: Instrument::Sine,
                 volume: 0.8,
                 mute: false,
+                solo: false,
+                effect: Effect::None,
                 notes: vec![
                     Note {
                         id: 2,

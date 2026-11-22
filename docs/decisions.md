@@ -34,5 +34,25 @@ Reasons: beats survive tempo edits, a pure renderer is easy to test, and the
 desktop shell must never block on audio callbacks.
 
 Consequences: `--sample` is generated in code (no proprietary assets); the
-WAV is exported in a cancellable CraftKit job with progress; the on-screen
-playhead is silent and visual only.
+WAV is exported in a cancellable CraftKit job with progress; when no audio
+device is present the playhead is a silent, clearly-labelled visual preview.
+
+## ADR-003 — Productisation without changing the schema
+
+Date: 2026-11-22
+
+Decision: add productisation features (editing gestures, MIDI I/O, effects,
+mixer, optional real-time playback) while keeping `format = musiccraft`,
+`schema_version = 1`, the launcher manifest and the JSON envelope unchanged.
+New document fields (`master_volume`, `solo`, `effect` and extra instrument
+variants) are additive and deserialized with serde defaults, so v0.1.0 files
+still open.
+
+Alternatives: bump the schema; split into multiple crates; embed a plugin host.
+
+Reasons: v0.1.0 is a published snapshot and the launcher rules must stay valid;
+additive fields keep existing projects loadable and CI simple.
+
+Consequences: no migration code is required; the piano roll records one
+`History` gesture per drag; real-time playback is best-effort and falls back to
+the offline preview on headless runners.
