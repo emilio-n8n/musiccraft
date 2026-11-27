@@ -2,6 +2,28 @@
 
 Short architecture decision records. Newest first.
 
+## ADR-004 — Bounded audio and lossless editing gestures
+
+Date: 2026-11-27
+
+Decision: keep schema 1 unchanged, group continuous UI edits into history
+gestures, prepare real-time playback in a cancellable job, and reject audio or
+MIDI values that exceed explicit representation/render limits. Quantization
+strength and grid selection are session UI state, not persisted document fields.
+
+Alternatives: store arbitrary MIDI program/tempo maps in the project; render on
+the UI thread; silently clamp oversized arrangements; snapshot every widget
+frame as an undo step.
+
+Reasons: the existing document intentionally has one tempo and one oscillator
+per track, the UI must stay responsive, and silent data loss or hundreds of
+undo steps per drag are user-visible failures.
+
+Consequences: SMF tempo maps and per-note program changes are approximated on
+import, zero-velocity notes are omitted on export, renders over ten minutes
+return an error, and MIDI imports are bounded. Regression tests cover these
+limits and the gesture/editing behaviour.
+
 ## ADR-001 — Built on CraftKit
 
 Date: 2026-11-22

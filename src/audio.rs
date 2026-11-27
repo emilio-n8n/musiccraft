@@ -31,6 +31,8 @@ pub enum AudioError {
     UnsupportedFormat(String),
     /// The stream could not be started.
     Stream(String),
+    /// Playback was requested without any rendered samples.
+    EmptyBuffer,
 }
 
 impl fmt::Display for AudioError {
@@ -42,6 +44,7 @@ impl fmt::Display for AudioError {
                 write!(formatter, "unsupported audio sample format: {format}")
             }
             Self::Stream(error) => write!(formatter, "audio stream error: {error}"),
+            Self::EmptyBuffer => formatter.write_str("no rendered audio to play"),
         }
     }
 }
@@ -122,6 +125,48 @@ impl Player {
                 error_callback,
                 None,
             ),
+            SampleFormat::F64 => device.build_output_stream(
+                config,
+                move |data: &mut [f64], _| write_samples(&callback_state, data, channels),
+                error_callback,
+                None,
+            ),
+            SampleFormat::I8 => device.build_output_stream(
+                config,
+                move |data: &mut [i8], _| write_samples(&callback_state, data, channels),
+                error_callback,
+                None,
+            ),
+            SampleFormat::U8 => device.build_output_stream(
+                config,
+                move |data: &mut [u8], _| write_samples(&callback_state, data, channels),
+                error_callback,
+                None,
+            ),
+            SampleFormat::I32 => device.build_output_stream(
+                config,
+                move |data: &mut [i32], _| write_samples(&callback_state, data, channels),
+                error_callback,
+                None,
+            ),
+            SampleFormat::U32 => device.build_output_stream(
+                config,
+                move |data: &mut [u32], _| write_samples(&callback_state, data, channels),
+                error_callback,
+                None,
+            ),
+            SampleFormat::I64 => device.build_output_stream(
+                config,
+                move |data: &mut [i64], _| write_samples(&callback_state, data, channels),
+                error_callback,
+                None,
+            ),
+            SampleFormat::U64 => device.build_output_stream(
+                config,
+                move |data: &mut [u64], _| write_samples(&callback_state, data, channels),
+                error_callback,
+                None,
+            ),
             SampleFormat::I16 => device.build_output_stream(
                 config,
                 move |data: &mut [i16], _| write_samples(&callback_state, data, channels),
@@ -166,11 +211,16 @@ impl Player {
     ///
     /// # Errors
     ///
-    /// Returns [`AudioError::Stream`] when no stream exists or cannot start.
+    /// Returns [`AudioError::NoDevice`] when no stream exists,
+    /// [`AudioError::EmptyBuffer`] for empty input, or [`AudioError::Stream`]
+    /// when the stream cannot start.
     pub fn play(&self, samples: Vec<f32>, loops: bool) -> Result<(), AudioError> {
         let Some(stream) = self.stream.as_ref() else {
             return Err(AudioError::NoDevice);
         };
+        if samples.is_empty() {
+            return Err(AudioError::EmptyBuffer);
+        }
         {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             state.samples = samples;
@@ -178,29 +228,50 @@ impl Player {
             state.loops = loops;
             state.playing = true;
         }
-        stream
-            .play()
-            .map_err(|error| AudioError::Stream(error.to_string()))
+        stream.play().map_err(|error| {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.playing = false;
+            state.cursor = 0;
+            state.samples.clear();
+            AudioError::Stream(error.to_string())
+        })
     }
 
     /// Pause without discarding the current position.
     pub fn pause(&self) {
+        if let Some(stream) = self.stream.as_ref() {
+            let _ = stream.pause();
+        }
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.playing = false;
     }
 
     /// Resume from the current position when a buffer is loaded.
     pub fn resume(&self) -> bool {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if state.samples.is_empty() {
+        let Some(stream) = self.stream.as_ref() else {
+            return false;
+        };
+        {
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.samples.is_empty() {
+                return false;
+            }
+        }
+        if stream.play().is_err() {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.playing = false;
             return false;
         }
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.playing = true;
         true
     }
 
     /// Stop playback, rewind and drop the buffer so the next play re-renders.
     pub fn stop(&self) {
+        if let Some(stream) = self.stream.as_ref() {
+            let _ = stream.pause();
+        }
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.playing = false;
         state.cursor = 0;
@@ -237,13 +308,23 @@ where
 
     let channels = channels.max(1);
     for frame in output.chunks_exact_mut(channels) {
-        let sample = state.samples.get(state.cursor).copied().unwrap_or(0.0);
+        if !state.playing {
+            fill_silence(frame);
+            continue;
+        }
+        let sample = state
+            .samples
+            .get(state.cursor)
+            .copied()
+            .filter(|sample| sample.is_finite())
+            .unwrap_or(0.0);
         state.cursor += 1;
         if state.cursor >= state.samples.len() {
             if state.loops {
                 state.cursor = 0;
             } else {
                 state.playing = false;
+                state.cursor = state.samples.len();
             }
         }
         for channel in frame {
@@ -293,8 +374,23 @@ mod tests {
         let mut output = [0.0_f32; 6];
         write_samples(&state, &mut output, 2);
         assert_eq!(output, [0.5, 0.5, -0.5, -0.5, 0.0, 0.0]);
-        assert_eq!(state.lock().map(|s| s.cursor).unwrap_or(0), 3);
+        assert_eq!(state.lock().map(|s| s.cursor).unwrap_or(0), 2);
         assert!(!state.lock().map(|s| s.playing).unwrap_or(true));
+    }
+
+    #[test]
+    fn write_samples_loops_and_sanitizes_non_finite_samples() {
+        let state = Arc::new(Mutex::new(PlaybackState {
+            samples: vec![f32::NAN, 0.5],
+            cursor: 0,
+            playing: true,
+            loops: true,
+        }));
+        let mut output = [1.0_f32; 6];
+        write_samples(&state, &mut output, 2);
+        assert_eq!(output, [0.0, 0.0, 0.5, 0.5, 0.0, 0.0]);
+        assert_eq!(state.lock().map(|s| s.cursor).unwrap_or(0), 1);
+        assert!(state.lock().map(|s| s.playing).unwrap_or(false));
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use craftkit_io::DocumentHost;
-use craftkit_jobs::JobRunner;
+use craftkit_jobs::{JobId, JobRunner};
 use craftkit_ui::cli::CliOptions;
 use craftkit_ui::eframe::{self, egui};
 use craftkit_ui::egui::{
@@ -58,6 +58,7 @@ enum Action {
 enum PendingAction {
     New,
     Open(PathBuf),
+    ImportMidi(Document, PathBuf),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,9 +73,7 @@ enum TrackEdit {
     ToggleMute,
     ToggleSolo,
     SetInstrument(Instrument),
-    SetVolume(f32),
     SetEffect(Effect),
-    Rename(String),
     Remove,
 }
 
@@ -98,6 +97,7 @@ type TrackRow = (usize, String, Instrument, f32, bool, bool, Effect, f32);
 #[derive(Debug, Clone, Copy)]
 struct NoteDrag {
     mode: DragMode,
+    track_index: usize,
     note_id: u64,
     start_x: f32,
     start_y: f32,
@@ -111,6 +111,9 @@ pub struct MusicCraftApp {
     selected_track: usize,
     selected_note: Option<u64>,
     jobs: JobRunner<PathBuf>,
+    playback_jobs: JobRunner<Vec<f32>>,
+    playback_job: Option<JobId>,
+    playback_request: u64,
     pending: Option<PendingAction>,
     player: Player,
     realtime: bool,
@@ -119,6 +122,7 @@ pub struct MusicCraftApp {
     last_tick: Option<Instant>,
     drag: Option<NoteDrag>,
     quantize_grid: f64,
+    quantize_strength: f64,
 }
 
 impl MusicCraftApp {
@@ -143,6 +147,9 @@ impl MusicCraftApp {
             selected_track: 0,
             selected_note: None,
             jobs: JobRunner::new(),
+            playback_jobs: JobRunner::new(),
+            playback_job: None,
+            playback_request: 0,
             pending: None,
             player: Player::new(),
             realtime: false,
@@ -151,6 +158,7 @@ impl MusicCraftApp {
             last_tick: None,
             drag: None,
             quantize_grid: edit::DEFAULT_GRID,
+            quantize_strength: 1.0,
         };
         app.shell.install_theme(&context.egui_ctx);
         if app.player.is_available() {
@@ -168,6 +176,31 @@ impl MusicCraftApp {
             app.load_path(path);
         }
         app
+    }
+
+    fn start_ui_gesture(&mut self) {
+        // A newly focused control starts a separate gesture even if the prior
+        // control did not emit a focus-loss event in this frame.
+        self.host.history_mut().end_gesture();
+        self.host.history_mut().begin_gesture();
+    }
+
+    fn end_ui_gesture(&mut self) {
+        self.host.history_mut().end_gesture();
+    }
+
+    fn mutate_document_continuously(&mut self, mutate: impl FnOnce(&mut Document)) {
+        self.stop_for_edit();
+        self.host.history_mut().begin_gesture();
+        mutate(self.host.history_mut().current_mut());
+    }
+
+    fn stop_for_edit(&mut self) {
+        if self.playing || self.realtime || self.playback_job.is_some() {
+            self.stop();
+            self.shell
+                .set_status("Playback stopped because the document changed");
+        }
     }
 
     fn load_path(&mut self, path: PathBuf) {
@@ -252,6 +285,7 @@ impl MusicCraftApp {
         match action {
             PendingAction::New => self.new_document(),
             PendingAction::Open(path) => self.load_path(path),
+            PendingAction::ImportMidi(document, path) => self.load_midi_document(document, path),
         }
     }
 
@@ -306,9 +340,14 @@ impl MusicCraftApp {
             return;
         }
         if self.playing {
-            self.playing = false;
-            self.player.pause();
-            self.shell.set_status("Playback paused");
+            if self.playback_job.is_some() {
+                self.stop();
+                self.shell.set_status("Playback preparation cancelled");
+            } else {
+                self.playing = false;
+                self.player.pause();
+                self.shell.set_status("Playback paused");
+            }
             return;
         }
         if self.realtime && self.player.resume() {
@@ -317,33 +356,89 @@ impl MusicCraftApp {
             self.shell.set_status("Real-time playback resumed");
             return;
         }
+
         self.playing = true;
+        self.realtime = false;
         self.last_tick = None;
-        if self.player.is_available() {
-            let samples = engine::render(self.host.document());
-            match self.player.play(samples, true) {
-                Ok(()) => {
-                    self.realtime = true;
-                    self.shell.set_status(format!(
-                        "Real-time playback — {}",
-                        self.player.device_name().unwrap_or("default output")
-                    ));
-                }
-                Err(error) => {
-                    self.realtime = false;
-                    self.shell.set_status(format!("Offline preview — {error}"));
-                }
-            }
-        } else {
-            self.realtime = false;
+        self.playback_request = self.playback_request.saturating_add(1);
+        if !self.player.is_available() {
             self.shell
                 .set_status("Offline preview (no audio device) — visual playhead only, no sound");
+            return;
+        }
+
+        self.playhead_beats = 0.0;
+        let document = self.host.document().clone();
+        let spawned = self
+            .playback_jobs
+            .spawn("Preparing playback", move |context| {
+                context.set_progress_message(0.0, "Rendering audio");
+                let samples = engine::render_with_progress(
+                    &document,
+                    |fraction| context.set_progress_message(fraction, "Rendering audio"),
+                    || context.is_cancelled(),
+                )
+                .map_err(|error| error.to_string())?;
+                context.set_progress_message(1.0, "Ready");
+                Ok(samples)
+            });
+        match spawned {
+            Ok(id) => {
+                self.playback_job = Some(id);
+                self.shell.set_status("Preparing real-time playback...");
+            }
+            Err(error) => {
+                self.playing = false;
+                self.shell
+                    .notify(Tone::Error, "Could not prepare playback", error.to_string());
+            }
+        }
+    }
+
+    fn poll_playback_jobs(&mut self) {
+        let request = self.playback_request;
+        for (id, result) in self.playback_jobs.poll() {
+            if self.playback_job != Some(id) {
+                continue;
+            }
+            self.playback_job = None;
+            if request != self.playback_request || !self.playing {
+                continue;
+            }
+            match result {
+                Ok(samples) => match self.player.play(samples, true) {
+                    Ok(()) => {
+                        self.realtime = true;
+                        self.shell.set_status(format!(
+                            "Real-time playback — {}",
+                            self.player.device_name().unwrap_or("default output")
+                        ));
+                    }
+                    Err(error) => {
+                        self.realtime = false;
+                        self.shell.set_status(format!("Offline preview — {error}"));
+                    }
+                },
+                Err(error) if error.contains("cancel") => {
+                    self.playing = false;
+                    self.shell.set_status("Playback preparation cancelled");
+                }
+                Err(error) => {
+                    self.playing = false;
+                    self.shell
+                        .notify(Tone::Error, "Could not prepare playback", error);
+                }
+            }
         }
     }
 
     fn stop(&mut self) {
         self.playing = false;
         self.realtime = false;
+        self.playback_request = self.playback_request.saturating_add(1);
+        if let Some(id) = self.playback_job.take() {
+            self.playback_jobs.cancel(id);
+        }
         self.player.stop();
         self.playhead_beats = 0.0;
         self.last_tick = None;
@@ -352,6 +447,11 @@ impl MusicCraftApp {
     fn update_playhead(&mut self, ui: &egui::Ui) {
         if !self.playing {
             self.last_tick = None;
+            return;
+        }
+        if self.playback_job.is_some() {
+            self.last_tick = None;
+            ui.ctx().request_repaint();
             return;
         }
         let document = self.host.document();
@@ -382,6 +482,7 @@ impl MusicCraftApp {
     }
 
     fn add_track(&mut self) {
+        self.stop_for_edit();
         self.host.apply(|document| {
             let id = document.allocate_id();
             let number = document.tracks.len() + 1;
@@ -401,6 +502,7 @@ impl MusicCraftApp {
     }
 
     fn add_note(&mut self, track_index: usize, pitch: u8, start_beat: f64) {
+        self.stop_for_edit();
         self.host.apply(|document| {
             if track_index >= document.tracks.len() {
                 return;
@@ -429,6 +531,7 @@ impl MusicCraftApp {
     }
 
     fn apply_track_edit(&mut self, index: usize, edit: TrackEdit) {
+        self.stop_for_edit();
         match edit {
             TrackEdit::ToggleMute => {
                 self.host.apply(|document| {
@@ -458,20 +561,6 @@ impl MusicCraftApp {
                     }
                 });
             }
-            TrackEdit::SetVolume(volume) => {
-                self.host.apply(|document| {
-                    if let Some(track) = document.tracks.get_mut(index) {
-                        track.volume = Track::clamp_volume(volume);
-                    }
-                });
-            }
-            TrackEdit::Rename(name) => {
-                self.host.apply(|document| {
-                    if let Some(track) = document.tracks.get_mut(index) {
-                        track.name = name;
-                    }
-                });
-            }
             TrackEdit::Remove => {
                 self.host.apply(|document| {
                     if index < document.tracks.len() {
@@ -483,36 +572,79 @@ impl MusicCraftApp {
         self.clamp_selection();
     }
 
-    fn apply_note_edit(&mut self, track_index: usize, note_id: u64, edit: NoteEdit) {
-        self.host.apply(|document| {
-            let Some(track) = document.tracks.get_mut(track_index) else {
-                return;
-            };
-            let Some(note) = track.notes.iter_mut().find(|note| note.id == note_id) else {
-                return;
-            };
-            match edit {
-                NoteEdit::SetPitch(pitch) => note.pitch = Note::clamp_pitch(pitch),
-                NoteEdit::SetStart(start) if start.is_finite() && start >= 0.0 => {
-                    note.start_beat = start;
+    fn apply_effect_drag_response(
+        &mut self,
+        response: egui::Response,
+        index: usize,
+        effect: Effect,
+    ) {
+        if response.gained_focus() {
+            self.start_ui_gesture();
+        }
+        if response.changed() {
+            self.mutate_document_continuously(|document| {
+                if let Some(track) = document.tracks.get_mut(index) {
+                    track.effect = effect;
                 }
-                NoteEdit::SetLength(length) if length.is_finite() && length > 0.0 => {
-                    note.length_beats = length;
-                }
-                NoteEdit::SetVelocity(velocity) => {
-                    note.velocity = Note::clamp_velocity(velocity);
-                }
-                NoteEdit::Remove => {}
-                NoteEdit::SetStart(_) | NoteEdit::SetLength(_) => {}
-            }
-        });
+            });
+        }
+        if response.lost_focus() {
+            self.end_ui_gesture();
+        }
+    }
+
+    fn apply_note_edit(
+        &mut self,
+        track_index: usize,
+        note_id: u64,
+        edit: NoteEdit,
+        continuous: bool,
+    ) {
+        self.stop_for_edit();
+        if continuous {
+            self.host.history_mut().begin_gesture();
+            Self::mutate_note(
+                self.host.history_mut().current_mut(),
+                track_index,
+                note_id,
+                edit,
+            );
+        } else {
+            self.host.apply(|document| {
+                Self::mutate_note(document, track_index, note_id, edit);
+            });
+        }
         if matches!(edit, NoteEdit::Remove) {
             self.selected_note = None;
         }
         self.clamp_selection();
     }
 
+    fn mutate_note(document: &mut Document, track_index: usize, note_id: u64, edit: NoteEdit) {
+        let Some(track) = document.tracks.get_mut(track_index) else {
+            return;
+        };
+        let Some(note) = track.notes.iter_mut().find(|note| note.id == note_id) else {
+            return;
+        };
+        match edit {
+            NoteEdit::SetPitch(pitch) => note.pitch = Note::clamp_pitch(pitch),
+            NoteEdit::SetStart(start) if start.is_finite() && start >= 0.0 => {
+                note.start_beat = start;
+            }
+            NoteEdit::SetLength(length) if length.is_finite() && length > 0.0 => {
+                note.length_beats = length;
+            }
+            NoteEdit::SetVelocity(velocity) => {
+                note.velocity = Note::clamp_velocity(velocity);
+            }
+            NoteEdit::Remove => {}
+            NoteEdit::SetStart(_) | NoteEdit::SetLength(_) => {}
+        }
+    }
+
     fn remove_note(&mut self, track_index: usize, note_id: u64) {
+        self.stop_for_edit();
         self.host.apply(|document| {
             if let Some(track) = document.tracks.get_mut(track_index) {
                 track.notes.retain(|note| note.id != note_id);
@@ -526,6 +658,25 @@ impl MusicCraftApp {
         let Some(path) = dialogs::open_project("Import MIDI", &["mid", "midi"]) else {
             return;
         };
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.len() > midi::MAX_IMPORT_BYTES as u64 => {
+                self.shell.notify(
+                    Tone::Error,
+                    "Could not import MIDI",
+                    format!(
+                        "file is larger than the {} byte import limit",
+                        midi::MAX_IMPORT_BYTES
+                    ),
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                self.shell
+                    .notify(Tone::Error, "Could not read MIDI", error.to_string());
+                return;
+            }
+        }
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -536,18 +687,26 @@ impl MusicCraftApp {
         };
         match midi::import_bytes(&bytes) {
             Ok(document) => {
-                self.stop();
-                self.host.reset(document);
-                self.selected_track = 0;
-                self.selected_note = None;
-                self.shell
-                    .set_status(format!("Imported MIDI from {}", path.display()));
+                if self.host.is_dirty() {
+                    self.pending = Some(PendingAction::ImportMidi(document, path));
+                } else {
+                    self.load_midi_document(document, path);
+                }
             }
             Err(error) => {
                 self.shell
                     .notify(Tone::Error, "Could not import MIDI", error.to_string())
             }
         }
+    }
+
+    fn load_midi_document(&mut self, document: Document, path: PathBuf) {
+        self.stop();
+        self.host.reset(document);
+        self.selected_track = 0;
+        self.selected_note = None;
+        self.shell
+            .set_status(format!("Imported MIDI from {}", path.display()));
     }
 
     fn export_midi(&mut self) {
@@ -575,6 +734,7 @@ impl MusicCraftApp {
     }
 
     fn duplicate_selected_note(&mut self) {
+        self.stop_for_edit();
         let (track, note) = (self.selected_track, self.selected_note);
         let Some(note_id) = note else {
             self.shell.set_status("Select a note to duplicate");
@@ -593,7 +753,9 @@ impl MusicCraftApp {
     }
 
     fn quantize_selected(&mut self) {
+        self.stop_for_edit();
         let grid = edit::clamp_grid(self.quantize_grid);
+        let strength = self.quantize_strength;
         let track = self.selected_track;
         let note_id = self.selected_note;
         let mut changed = 0;
@@ -602,15 +764,20 @@ impl MusicCraftApp {
                 if let Some(track) = document.tracks.get_mut(track)
                     && let Some(note) = track.notes.iter_mut().find(|note| note.id == id)
                 {
-                    *note = edit::quantize_note(note, grid);
-                    changed = 1;
+                    let quantized = edit::quantize_note_with_strength(note, grid, strength);
+                    if quantized != *note {
+                        *note = quantized;
+                        changed = 1;
+                    }
                 }
             } else {
-                changed = edit::quantize_document(document, grid);
+                changed = edit::quantize_document_with_strength(document, grid, strength);
             }
         });
-        self.shell
-            .set_status(format!("Quantized {changed} note(s) to {grid} beat(s)"));
+        self.shell.set_status(format!(
+            "Quantized {changed} note(s) to {grid} beat(s) at {:.0}% strength",
+            strength * 100.0
+        ));
     }
 
     fn start_mixdown(&mut self) {
@@ -671,12 +838,14 @@ impl MusicCraftApp {
             Action::ImportMidi => self.import_midi(),
             Action::ExportMidi => self.export_midi(),
             Action::Undo => {
+                self.stop_for_edit();
                 if self.host.undo() {
                     self.clamp_selection();
                     self.shell.set_status("Undo");
                 }
             }
             Action::Redo => {
+                self.stop_for_edit();
                 if self.host.redo() {
                     self.clamp_selection();
                     self.shell.set_status("Redo");
@@ -813,8 +982,9 @@ impl MusicCraftApp {
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let running = self.jobs.jobs();
+        let playback = self.playback_jobs.jobs();
         self.shell.status_bar_with(ui, |ui| {
-            for job in running {
+            for job in running.iter().chain(playback) {
                 widgets::job_row(ui, job);
             }
         });
@@ -867,9 +1037,22 @@ impl MusicCraftApp {
                                     self.selected_track = *index;
                                 }
                                 let mut renamed = name.clone();
-                                ui.add(TextEdit::singleline(&mut renamed).hint_text("Track name"));
+                                let response = ui.add(
+                                    TextEdit::singleline(&mut renamed).hint_text("Track name"),
+                                );
+                                if response.gained_focus() {
+                                    self.start_ui_gesture();
+                                }
                                 if renamed != *name && !renamed.trim().is_empty() {
-                                    actions.push((*index, TrackEdit::Rename(renamed)));
+                                    let value = renamed.clone();
+                                    self.mutate_document_continuously(|document| {
+                                        if let Some(track) = document.tracks.get_mut(*index) {
+                                            track.name = value;
+                                        }
+                                    });
+                                }
+                                if response.lost_focus() {
+                                    self.end_ui_gesture();
                                 }
                                 ComboBox::from_id_salt(format!("instrument-{index}"))
                                     .selected_text(instrument.label())
@@ -890,18 +1073,27 @@ impl MusicCraftApp {
                                         }
                                     });
                                 effect_selector(ui, effect, *index, &mut actions);
-                                effect_params_ui(ui, effect, *index, &mut actions);
+                                effect_params_ui(self, ui, effect, *index);
                                 let mut mixer_volume = *volume;
-                                if ui
-                                    .add(
-                                        DragValue::new(&mut mixer_volume)
-                                            .range(0.0..=1.0)
-                                            .speed(0.01)
-                                            .prefix("Vol "),
-                                    )
-                                    .changed()
-                                {
-                                    actions.push((*index, TrackEdit::SetVolume(mixer_volume)));
+                                let response = ui.add(
+                                    DragValue::new(&mut mixer_volume)
+                                        .range(0.0..=1.0)
+                                        .speed(0.01)
+                                        .prefix("Vol "),
+                                );
+                                if response.gained_focus() {
+                                    self.start_ui_gesture();
+                                }
+                                if response.changed() {
+                                    let value = Track::clamp_volume(mixer_volume);
+                                    self.mutate_document_continuously(|document| {
+                                        if let Some(track) = document.tracks.get_mut(*index) {
+                                            track.volume = value;
+                                        }
+                                    });
+                                }
+                                if response.lost_focus() {
+                                    self.end_ui_gesture();
                                 }
                                 ui.horizontal(|ui| {
                                     let mute_label = if *mute { "Unmute" } else { "Mute" };
@@ -922,18 +1114,23 @@ impl MusicCraftApp {
                 ui.separator();
                 widgets::section_label(ui, "Master");
                 let mut master = self.host.document().master_volume;
-                if ui
-                    .add(
-                        DragValue::new(&mut master)
-                            .range(0.0..=1.0)
-                            .speed(0.01)
-                            .prefix("Out "),
-                    )
-                    .changed()
-                {
-                    self.host.apply(|document| {
-                        document.master_volume = Track::clamp_volume(master);
+                let response = ui.add(
+                    DragValue::new(&mut master)
+                        .range(0.0..=1.0)
+                        .speed(0.01)
+                        .prefix("Out "),
+                );
+                if response.gained_focus() {
+                    self.start_ui_gesture();
+                }
+                if response.changed() {
+                    let value = Track::clamp_volume(master);
+                    self.mutate_document_continuously(|document| {
+                        document.master_volume = value;
                     });
+                }
+                if response.lost_focus() {
+                    self.end_ui_gesture();
                 }
                 if ui.button("Add track").clicked() {
                     add_track = true;
@@ -965,6 +1162,8 @@ impl MusicCraftApp {
         let mut select: Option<u64> = None;
         let mut add = false;
         let mut edits: Vec<NoteEdit> = Vec::new();
+        let mut gesture_started = false;
+        let mut gesture_ended = false;
 
         egui::Panel::right("notes-panel")
             .resizable(true)
@@ -1017,29 +1216,38 @@ impl MusicCraftApp {
 
                         ui.horizontal(|ui| {
                             ui.label("Pitch");
-                            ui.add(DragValue::new(&mut pitch).range(PITCH_LOW..=PITCH_HIGH));
+                            let response = ui.add(DragValue::new(&mut pitch).range(0..=127));
+                            gesture_started |= response.gained_focus();
+                            gesture_ended |= response.lost_focus();
                         });
                         ui.horizontal(|ui| {
                             ui.label("Start");
-                            ui.add(
+                            let response = ui.add(
                                 DragValue::new(&mut start)
                                     .range(0.0..=256.0)
                                     .speed(0.1)
                                     .suffix(" b"),
                             );
+                            gesture_started |= response.gained_focus();
+                            gesture_ended |= response.lost_focus();
                         });
                         ui.horizontal(|ui| {
                             ui.label("Length");
-                            ui.add(
+                            let response = ui.add(
                                 DragValue::new(&mut length)
                                     .range(0.125..=32.0)
                                     .speed(0.1)
                                     .suffix(" b"),
                             );
+                            gesture_started |= response.gained_focus();
+                            gesture_ended |= response.lost_focus();
                         });
                         ui.horizontal(|ui| {
                             ui.label("Velocity");
-                            ui.add(DragValue::new(&mut velocity).range(0.0..=1.0).speed(0.02));
+                            let response =
+                                ui.add(DragValue::new(&mut velocity).range(0.0..=1.0).speed(0.02));
+                            gesture_started |= response.gained_focus();
+                            gesture_ended |= response.lost_focus();
                         });
 
                         if pitch != note.pitch {
@@ -1068,17 +1276,27 @@ impl MusicCraftApp {
             self.selected_note = Some(id);
         }
         if add {
-            let beat = self.playhead_beats.round();
+            let beat = edit::snap(self.playhead_beats, self.quantize_grid);
             self.add_note(track_index, 60, beat);
         }
-        for edit in edits {
-            if matches!(edit, NoteEdit::Remove) {
-                if let Some(id) = self.selected_note {
-                    self.remove_note(track_index, id);
-                }
-            } else if let Some(id) = self.selected_note {
-                self.apply_note_edit(track_index, id, edit);
+        if edits.iter().any(|edit| matches!(edit, NoteEdit::Remove)) {
+            if let Some(id) = self.selected_note {
+                self.remove_note(track_index, id);
             }
+        } else if !edits.is_empty() {
+            if let Some(id) = self.selected_note {
+                if gesture_started {
+                    self.start_ui_gesture();
+                }
+                for edit in edits {
+                    self.apply_note_edit(track_index, id, edit, true);
+                }
+                if gesture_ended {
+                    self.end_ui_gesture();
+                }
+            }
+        } else if gesture_ended {
+            self.end_ui_gesture();
         }
     }
 
@@ -1090,11 +1308,13 @@ impl MusicCraftApp {
         let original_bpm = bpm;
         let mut title_gained = false;
         let mut title_lost = false;
+        let mut bpm_gained = false;
+        let mut bpm_lost = false;
         let mut mixdown = false;
         let mut settings = false;
         let mut add_note: Option<(usize, u8, f64)> = None;
         let mut select: Option<(usize, u64)> = None;
-        let mut drag_start: Option<(u64, DragMode, f32, f32, Note)> = None;
+        let mut drag_start: Option<(usize, u64, DragMode, f32, f32, Note)> = None;
         let mut drag_delta: Option<(f32, f32)> = None;
         let mut drag_end = false;
         let mut quantize = false;
@@ -1143,8 +1363,8 @@ impl MusicCraftApp {
                         .speed(1.0)
                         .prefix("BPM "),
                 );
-                title_gained |= response.gained_focus();
-                title_lost |= response.lost_focus();
+                bpm_gained |= response.gained_focus();
+                bpm_lost |= response.lost_focus();
             });
             ui.horizontal(|ui| {
                 ui.label("Title");
@@ -1158,6 +1378,40 @@ impl MusicCraftApp {
                     .size(10.5)
                     .color(theme::FAINT),
             );
+            ui.horizontal(|ui| {
+                ui.label("Quantize grid");
+                ComboBox::from_id_salt("quantize-grid")
+                    .selected_text(grid_label(self.quantize_grid))
+                    .show_ui(ui, |ui| {
+                        for grid in [0.125, 0.25, 0.5, 1.0, 2.0, 4.0] {
+                            if ui
+                                .selectable_label(
+                                    (self.quantize_grid - grid).abs() < f64::EPSILON,
+                                    grid_label(grid),
+                                )
+                                .clicked()
+                            {
+                                self.quantize_grid = grid;
+                            }
+                        }
+                    });
+                let mut strength = self.quantize_strength;
+                if ui
+                    .add(
+                        DragValue::new(&mut strength)
+                            .range(0.0..=1.0)
+                            .speed(0.01)
+                            .prefix("Strength "),
+                    )
+                    .changed()
+                {
+                    self.quantize_strength = if strength.is_finite() {
+                        strength.clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                }
+            });
 
             let total_beats = (document.duration_beats() + 4.0).max(8.0);
             let content = Vec2::new(
@@ -1219,7 +1473,9 @@ impl MusicCraftApp {
                             instrument_color(track.instrument)
                         };
                         for note in &track.notes {
-                            let note_rect = note_rect(note, origin);
+                            let Some(note_rect) = note_rect(note, origin) else {
+                                continue;
+                            };
                             let is_selected = track_index == self.selected_track
                                 && self.selected_note == Some(note.id);
                             painter.rect_filled(
@@ -1257,51 +1513,34 @@ impl MusicCraftApp {
                     if response.clicked()
                         && let Some(position) = response.interact_pointer_pos()
                     {
-                        let mut hit = None;
-                        'search: for (track_index, track) in document.tracks.iter().enumerate() {
-                            for note in &track.notes {
-                                if note_rect(note, origin).contains(position) {
-                                    hit = Some((track_index, note.id));
-                                    break 'search;
-                                }
-                            }
-                        }
-                        if let Some((track_index, id)) = hit {
+                        let hit = hit_test_note(&document, position, origin, false);
+                        if let Some((track_index, id, _)) = hit {
                             select = Some((track_index, id));
                         } else if position.x >= origin.x && position.y >= origin.y {
-                            let beat = ((position.x - origin.x) / BEAT_WIDTH).max(0.0).round();
+                            let beat = edit::snap(
+                                f64::from(((position.x - origin.x) / BEAT_WIDTH).max(0.0)),
+                                self.quantize_grid,
+                            );
                             let pitch = (f32::from(PITCH_HIGH)
                                 - (position.y - origin.y) / ROW_HEIGHT)
                                 .round();
                             let pitch =
                                 pitch.clamp(f32::from(PITCH_LOW), f32::from(PITCH_HIGH)) as u8;
-                            add_note = Some((self.selected_track, pitch, f64::from(beat)));
+                            add_note = Some((self.selected_track, pitch, beat));
                         }
                     }
 
                     if response.drag_started()
                         && let Some(position) = response.interact_pointer_pos()
+                        && let Some((track_index, id, mode)) =
+                            hit_test_note(&document, position, origin, true)
+                        && let Some(note) = document
+                            .tracks
+                            .get(track_index)
+                            .and_then(|track| track.notes.iter().find(|note| note.id == id))
                     {
-                        let mut hit = None;
-                        'drag_search: for (track_index, track) in document.tracks.iter().enumerate()
-                        {
-                            for note in &track.notes {
-                                let rect = note_rect(note, origin);
-                                if rect.contains(position) {
-                                    let mode = if position.x >= rect.max.x - 6.0 {
-                                        DragMode::Resize
-                                    } else {
-                                        DragMode::Move
-                                    };
-                                    hit = Some((track_index, *note, mode));
-                                    break 'drag_search;
-                                }
-                            }
-                        }
-                        if let Some((track_index, note, mode)) = hit {
-                            select = Some((track_index, note.id));
-                            drag_start = Some((note.id, mode, position.x, position.y, note));
-                        }
+                        select = Some((track_index, id));
+                        drag_start = Some((track_index, id, mode, position.x, position.y, *note));
                     }
                     if let Some(position) = response.interact_pointer_pos()
                         && (response.dragged() || response.drag_stopped())
@@ -1315,19 +1554,33 @@ impl MusicCraftApp {
                 });
         });
 
-        if title != original_title && !title.trim().is_empty() {
-            self.host.apply(|document| document.title = title.clone());
+        if title_gained {
+            self.start_ui_gesture();
         }
-        if (bpm - original_bpm).abs() > f64::EPSILON {
-            self.host.apply(|document| document.bpm = bpm);
+        if title != original_title && !title.trim().is_empty() {
+            let value = title.clone();
+            self.mutate_document_continuously(|document| document.title = value);
+        }
+        if title_lost {
+            self.end_ui_gesture();
+        }
+        if bpm_gained {
+            self.start_ui_gesture();
+        }
+        if (bpm - original_bpm).abs() > f64::EPSILON && bpm.is_finite() {
+            self.mutate_document_continuously(|document| document.bpm = bpm);
+        }
+        if bpm_lost {
+            self.end_ui_gesture();
         }
         if let Some((track_index, id)) = select {
             self.selected_track = track_index;
             self.selected_note = Some(id);
         }
-        if let Some((note_id, mode, start_x, start_y, original)) = drag_start {
+        if let Some((track_index, note_id, mode, start_x, start_y, original)) = drag_start {
             self.drag = Some(NoteDrag {
                 mode,
+                track_index,
                 note_id,
                 start_x,
                 start_y,
@@ -1340,13 +1593,20 @@ impl MusicCraftApp {
         {
             let delta_beats = f64::from(x - drag.start_x) / f64::from(BEAT_WIDTH);
             let delta_pitch = ((drag.start_y - y) / ROW_HEIGHT).round() as i32;
-            let updated = match drag.mode {
+            let mut updated = match drag.mode {
                 DragMode::Move => edit::move_note(&drag.original, delta_beats, delta_pitch),
                 DragMode::Resize => {
-                    edit::resize_note(&drag.original, drag.original.length_beats + delta_beats)
+                    let end =
+                        edit::snap(drag.original.end_beat() + delta_beats, self.quantize_grid);
+                    edit::resize_note(&drag.original, end - drag.original.start_beat)
                 }
             };
-            let track_index = self.selected_track;
+            if matches!(drag.mode, DragMode::Move) {
+                updated.start_beat = edit::snap(updated.start_beat, self.quantize_grid);
+                updated.pitch = updated.pitch.clamp(PITCH_LOW, PITCH_HIGH);
+            }
+            self.stop_for_edit();
+            let track_index = drag.track_index;
             let note_id = drag.note_id;
             if let Some(note) = self
                 .host
@@ -1362,7 +1622,7 @@ impl MusicCraftApp {
         if drag_end && self.drag.is_some() {
             self.host.history_mut().end_gesture();
             self.drag = None;
-            self.shell.set_status("Note edit recorded as one undo step");
+            self.shell.set_status("Note edit complete (one undo step)");
         }
         if let Some((track_index, pitch, beat)) = add_note {
             self.add_note(track_index, pitch, beat);
@@ -1416,6 +1676,7 @@ impl MusicCraftApp {
 impl eframe::App for MusicCraftApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_jobs();
+        self.poll_playback_jobs();
         self.update_playhead(ui);
         self.handle_shortcuts(ui);
         self.top_bar(ui);
@@ -1430,17 +1691,50 @@ impl eframe::App for MusicCraftApp {
     }
 }
 
-fn note_rect(note: &Note, origin: Pos2) -> Rect {
-    let pitch = note.pitch.clamp(PITCH_LOW, PITCH_HIGH);
+fn note_rect(note: &Note, origin: Pos2) -> Option<Rect> {
+    if !note.is_valid() || !(PITCH_LOW..=PITCH_HIGH).contains(&note.pitch) {
+        return None;
+    }
     let x = origin.x + note.start_beat as f32 * BEAT_WIDTH;
-    let y = origin.y + f32::from(PITCH_HIGH - pitch) * ROW_HEIGHT;
-    Rect::from_min_size(
+    let y = origin.y + f32::from(PITCH_HIGH - note.pitch) * ROW_HEIGHT;
+    Some(Rect::from_min_size(
         Pos2::new(x, y + 1.0),
         Vec2::new(
             (note.length_beats as f32 * BEAT_WIDTH).max(3.0),
             ROW_HEIGHT - 2.0,
         ),
-    )
+    ))
+}
+
+fn hit_test_note(
+    document: &Document,
+    position: Pos2,
+    origin: Pos2,
+    resize_edges: bool,
+) -> Option<(usize, u64, DragMode)> {
+    // Later tracks and notes are painted later, so search in reverse to select
+    // the visible topmost note when rectangles overlap.
+    for (track_index, track) in document.tracks.iter().enumerate().rev() {
+        for note in track.notes.iter().rev() {
+            let Some(rect) = note_rect(note, origin) else {
+                continue;
+            };
+            if rect.contains(position) {
+                let mode = if resize_edges && position.x >= rect.max.x - 6.0 {
+                    DragMode::Resize
+                } else {
+                    DragMode::Move
+                };
+                return Some((track_index, note.id, mode));
+            }
+        }
+    }
+    None
+}
+
+fn grid_label(grid: f64) -> String {
+    let denominator = (4.0 / edit::clamp_grid(grid)).round().max(1.0) as u32;
+    format!("1/{denominator}")
 }
 
 fn effect_selector(
@@ -1474,12 +1768,7 @@ fn effect_selector(
         });
 }
 
-fn effect_params_ui(
-    ui: &mut egui::Ui,
-    effect: &Effect,
-    index: usize,
-    actions: &mut Vec<(usize, TrackEdit)>,
-) {
+fn effect_params_ui(app: &mut MusicCraftApp, ui: &mut egui::Ui, effect: &Effect, index: usize) {
     match *effect {
         Effect::None => {}
         Effect::Delay {
@@ -1491,79 +1780,76 @@ fn effect_params_ui(
             let mut feedback_value = feedback;
             let mut mix_value = mix;
             ui.horizontal(|ui| {
-                ui.add(DragValue::new(&mut time).range(0.125..=8.0).prefix("T "));
-                if ui
-                    .add(
-                        DragValue::new(&mut feedback_value)
-                            .range(0.0..=0.9)
-                            .prefix("FB "),
-                    )
-                    .changed()
-                {
-                    actions.push((
-                        index,
-                        TrackEdit::SetEffect(Effect::Delay {
-                            time_beats: time,
-                            feedback: feedback_value,
-                            mix: mix_value,
-                        }),
-                    ));
-                }
-                if ui
-                    .add(
-                        DragValue::new(&mut mix_value)
-                            .range(0.0..=1.0)
-                            .prefix("Mix "),
-                    )
-                    .changed()
-                {
-                    actions.push((
-                        index,
-                        TrackEdit::SetEffect(Effect::Delay {
-                            time_beats: time,
-                            feedback: feedback_value,
-                            mix: mix_value,
-                        }),
-                    ));
-                }
+                let response = ui.add(DragValue::new(&mut time).range(0.125..=8.0).prefix("T "));
+                app.apply_effect_drag_response(
+                    response,
+                    index,
+                    Effect::Delay {
+                        time_beats: time,
+                        feedback: feedback_value,
+                        mix: mix_value,
+                    },
+                );
+                let response = ui.add(
+                    DragValue::new(&mut feedback_value)
+                        .range(0.0..=0.9)
+                        .prefix("FB "),
+                );
+                app.apply_effect_drag_response(
+                    response,
+                    index,
+                    Effect::Delay {
+                        time_beats: time,
+                        feedback: feedback_value,
+                        mix: mix_value,
+                    },
+                );
+                let response = ui.add(
+                    DragValue::new(&mut mix_value)
+                        .range(0.0..=1.0)
+                        .prefix("Mix "),
+                );
+                app.apply_effect_drag_response(
+                    response,
+                    index,
+                    Effect::Delay {
+                        time_beats: time,
+                        feedback: feedback_value,
+                        mix: mix_value,
+                    },
+                );
             });
         }
         Effect::Reverb { decay, mix } => {
             let mut decay_value = decay;
             let mut mix_value = mix;
             ui.horizontal(|ui| {
-                if ui
-                    .add(
-                        DragValue::new(&mut decay_value)
-                            .range(0.0..=0.95)
-                            .prefix("Decay "),
-                    )
-                    .changed()
-                {
-                    actions.push((
-                        index,
-                        TrackEdit::SetEffect(Effect::Reverb {
-                            decay: decay_value,
-                            mix: mix_value,
-                        }),
-                    ));
-                }
-                if ui
-                    .add(
-                        DragValue::new(&mut mix_value)
-                            .range(0.0..=1.0)
-                            .prefix("Mix "),
-                    )
-                    .changed()
-                {
-                    actions.push((
-                        index,
-                        TrackEdit::SetEffect(Effect::Reverb {
-                            decay: decay_value,
-                            mix: mix_value,
-                        }),
-                    ));
-                }
+                let response = ui.add(
+                    DragValue::new(&mut decay_value)
+                        .range(0.0..=0.95)
+                        .prefix("Decay "),
+                );
+                app.apply_effect_drag_response(
+                    response,
+                    index,
+                    Effect::Reverb {
+                        decay: decay_value,
+                        mix: mix_value,
+                    },
+                );
+                let response = ui.add(
+                    DragValue::new(&mut mix_value)
+                        .range(0.0..=1.0)
+                        .prefix("Mix "),
+                );
+                app.apply_effect_drag_response(
+                    response,
+                    index,
+                    Effect::Reverb {
+                        decay: decay_value,
+                        mix: mix_value,
+                    },
+                );
             });
         }
     }
@@ -1593,5 +1879,55 @@ fn slugify(title: &str) -> String {
         "untitled".to_owned()
     } else {
         slug.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn note(id: u64, pitch: u8) -> Note {
+        Note {
+            id,
+            pitch,
+            start_beat: 0.0,
+            length_beats: 1.0,
+            velocity: 0.8,
+        }
+    }
+
+    #[test]
+    fn piano_roll_does_not_draw_out_of_range_or_invalid_notes_on_false_rows() {
+        let origin = Pos2::new(100.0, 20.0);
+        assert!(note_rect(&note(1, PITCH_LOW - 1), origin).is_none());
+        assert!(note_rect(&note(2, PITCH_HIGH + 1), origin).is_none());
+        let mut invalid = note(3, 60);
+        invalid.length_beats = f64::NAN;
+        assert!(note_rect(&invalid, origin).is_none());
+        assert!(note_rect(&note(4, 60), origin).is_some());
+    }
+
+    #[test]
+    fn piano_roll_hit_testing_selects_the_topmost_overlapping_note() {
+        let mut document = Document::sample();
+        document.tracks.truncate(2);
+        document.tracks[0].notes = vec![note(100, 60)];
+        document.tracks[1].notes = vec![note(101, 60)];
+        let origin = Pos2::new(100.0, 20.0);
+        let rect = note_rect(&document.tracks[1].notes[0], origin).expect("visible note");
+        let hit = hit_test_note(&document, rect.center(), origin, false).expect("hit");
+        assert_eq!(hit, (1, 101, DragMode::Move));
+        let edge = Pos2::new(rect.max.x - 2.0, rect.center().y);
+        assert_eq!(
+            hit_test_note(&document, edge, origin, true),
+            Some((1, 101, DragMode::Resize))
+        );
+    }
+
+    #[test]
+    fn quantization_grid_labels_are_musical_note_values() {
+        assert_eq!(grid_label(0.125), "1/32");
+        assert_eq!(grid_label(0.25), "1/16");
+        assert_eq!(grid_label(4.0), "1/1");
     }
 }

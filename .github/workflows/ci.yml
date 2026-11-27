@@ -43,10 +43,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (warnings are errors)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test
         run: cargo test --workspace --locked
 
       - name: Validate launcher metadata
-        run: python3 tools/launcher_check.py .
+        run: python3 tools/launcher_check.py . --expected-repo emilio-n8n/musiccraft

@@ -13,20 +13,25 @@ desktop foundation.
 
 - Native Rust desktop UI (egui/eframe), no web runtime.
 - Versioned JSON project files with atomic saves (`musiccraft`, schema 1).
-- Bounded undo/redo through the shared document history; one piano-roll drag is
-  one undo step.
+- Bounded undo/redo through the shared document history; one piano-roll drag,
+  typed title or mixer-control gesture is one undo step.
 - Piano-roll editing: drag to move, drag the right edge to resize, `D` to
-  duplicate, `Q` to quantize on a selectable grid.
-- MIDI import/export (SMF type 1) with `midly`; tempo, instruments and note
-  velocities are preserved.
-- Five built-in oscillators (sine, square, saw, triangle, noise) with a simple
-  ADSR envelope.
+  duplicate and `Q` to quantize. Grids from 1/32 to a whole note and a
+  0–100% quantization strength are selectable; drags snap to the active grid.
+- MIDI import/export (SMF type 1) with `midly`: initial tempo, track names,
+  GM-program mapping, velocities, overlapping same-key notes and hanging notes
+  are handled. Import is bounded to 16 MiB, 256 tracks and 100,000 notes.
+- Five built-in oscillators (sine, square, saw, triangle, noise) with an ADSR
+  envelope whose release remains continuous for short notes.
 - Mixer with mute, solo, per-track volume, master output and two simple insert
-  effects (delay and reverb).
-- Optional real-time playback via CPAL when an output device exists; otherwise
-  the transport runs a clearly-labelled offline visual preview.
+  effects (delay and reverb). Mute/solo never changes the gain of other tracks.
+- Optional real-time playback via CPAL when an output device exists; rendering
+  runs in a cancellable background job. Otherwise the transport runs a
+  clearly-labelled offline visual preview.
 - Offline mono mixdown to 32-bit float WAV at 44.1 kHz, with a cancellable
-  background job and progress reporting.
+  background job and progress reporting. Arrangements over ten minutes or
+  requiring more than 512 MiB of aggregate mono buffers fail explicitly instead
+  of producing a silently truncated WAV or exhausting memory.
 - Recent files and persisted preferences.
 - Offline-first: no account, no telemetry, no network required.
 
@@ -48,8 +53,9 @@ Without arguments the application opens an empty document.
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+python3 tools/launcher_check.py . --expected-repo emilio-n8n/musiccraft
 ```
 
 Linux windowing development packages are installed by the CI workflow.
@@ -89,10 +95,15 @@ solo, effect) and notes (pitch, start and length in beats, velocity) plus an
 identifier counter. New fields are additive with serde defaults, so v0.1.0
 project files remain readable at schema 1.
 
-WAV mixdown is rendered offline in a cancellable background job. Real-time
-playback is best-effort: when CPAL finds an output device the rendered buffer
-is streamed to it; on headless systems the transport reports "offline preview"
-and moves only the visual playhead. No plugin or VST is used.
+WAV mixdown and real-time buffer preparation run in cancellable background
+jobs. Real-time playback is best-effort: when CPAL finds an output device the
+rendered buffer is streamed to it; on headless systems the transport reports
+"offline preview" and moves only the visual playhead. No plugin or VST is used.
+
+The project schema and launcher manifest remain at version 1. MusicCraft stores
+one tempo and one oscillator per track, so SMF import uses the initial tempo and
+the last program change in each track. Zero-velocity project notes are silent
+and are omitted from SMF export because MIDI represents them as note-offs.
 
 ## Licence
 

@@ -2,6 +2,35 @@
 
 All notable changes to MusicCraft are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- Piano-roll hit testing now selects the topmost overlapping note and no longer
+  draws out-of-range MIDI pitches on a false visible row.
+- Continuous title, tempo, note, mixer and effect edits record one undo step per
+  gesture; delay-time changes now reach the document.
+- MIDI import preserves repeated note-ons on one key, closes hanging notes,
+  imports GM programs and empty named/programmed tracks, and allocates unique
+  track/note identifiers. Export orders note-offs before same-tick note-ons.
+- Invalid note positions and SMF tick overflow fail explicitly instead of
+  wrapping; MIDI import has file, track and note limits.
+- Short-note ADSR release is continuous, corrupt effect parameters cannot create
+  NaN samples, and mute/solo no longer changes remaining track gain.
+- CPAL pause/resume/stop now controls the stream, failed starts clear playback
+  state, and audio callbacks sanitize non-finite samples.
+- Real-time playback renders in a cancellable background job; stopping or
+  editing invalidates pending playback instead of starting stale audio later.
+- WAV writing sanitizes non-finite samples. Renders over ten minutes or over
+  512 MiB of aggregate mono buffers fail instead of truncating or exhausting
+  memory.
+
+### Added
+
+- Selectable quantization grid and strength, with grid-snapped piano-roll drags.
+- Regression coverage for MIDI polyphony/orphans/programs, UI hit testing,
+  quantization strength, mixer gain, ADSR, cancellation and WAV/MIDI bounds.
+
 ## [0.2.0] - 2026-11-22
 
 ### Added

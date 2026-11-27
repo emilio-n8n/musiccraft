@@ -13,6 +13,11 @@ use serde::{Deserialize, Serialize};
 pub const MAX_MIDI_PITCH: u8 = 127;
 /// Tempo used when a stored BPM value is missing or nonsensical.
 pub const DEFAULT_BPM: f64 = 120.0;
+/// Largest supported note onset or end position, in beats.
+///
+/// This keeps corrupt projects and duplicated notes away from floating-point
+/// overflow and from times that cannot be represented by an SMF file.
+pub const MAX_BEAT_POSITION: f64 = 1_000_000.0;
 
 /// Oscillator waveform assigned to a track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,27 +47,36 @@ impl Instrument {
         }
     }
 
-    /// Stable index used by MIDI program mapping.
+    /// General MIDI program used when exporting this oscillator.
     #[must_use]
-    pub const fn index(self) -> u8 {
+    pub const fn midi_program(self) -> u8 {
         match self {
-            Self::Sine => 0,
-            Self::Square => 1,
-            Self::Saw => 2,
-            Self::Triangle => 3,
-            Self::Noise => 4,
+            Self::Sine => 72,
+            Self::Square => 80,
+            Self::Saw => 81,
+            Self::Triangle => 82,
+            Self::Noise => 126,
         }
     }
 
-    /// Instrument for a stable index; unknown programs wrap around.
+    /// Map a General MIDI program to the closest built-in oscillator.
+    ///
+    /// MusicCraft projects store an oscillator rather than an arbitrary GM
+    /// program. The five programs emitted by [`Self::midi_program`] round-trip
+    /// exactly; other programs are grouped by their GM instrument family.
     #[must_use]
-    pub const fn from_index(index: u8) -> Self {
-        match index % 5 {
-            0 => Self::Sine,
-            1 => Self::Square,
-            2 => Self::Saw,
-            3 => Self::Triangle,
-            _ => Self::Noise,
+    pub fn from_midi_program(program: u8) -> Self {
+        match program {
+            72 => Self::Sine,
+            80 => Self::Square,
+            81 => Self::Saw,
+            82 => Self::Triangle,
+            126 => Self::Noise,
+            8..=15 | 96..=103 | 120..=125 | 127 => Self::Noise,
+            0..=7 | 16..=23 | 73..=79 => Self::Sine,
+            56..=63 | 83..=87 => Self::Square,
+            24..=55 | 64..=71 | 88..=95 | 104..=119 => Self::Saw,
+            _ => Self::Triangle,
         }
     }
 
@@ -141,6 +155,8 @@ pub enum NoteError {
     InvalidLength,
     /// Velocity is outside `0.0..=1.0` or not finite.
     InvalidVelocity,
+    /// The note ends beyond the supported beat range or its end is not finite.
+    PositionOutOfRange,
 }
 
 impl fmt::Display for NoteError {
@@ -150,6 +166,9 @@ impl fmt::Display for NoteError {
             Self::InvalidStart => "start beat must be finite and non-negative",
             Self::InvalidLength => "length in beats must be finite and positive",
             Self::InvalidVelocity => "velocity must be a finite value between 0 and 1",
+            Self::PositionOutOfRange => {
+                "note end must be finite and within the supported beat range"
+            }
         };
         formatter.write_str(message)
     }
@@ -175,6 +194,10 @@ impl Note {
         }
         if !self.velocity.is_finite() || !(0.0..=1.0).contains(&self.velocity) {
             return Err(NoteError::InvalidVelocity);
+        }
+        let end = self.end_beat();
+        if !end.is_finite() || end > MAX_BEAT_POSITION {
+            return Err(NoteError::PositionOutOfRange);
         }
         Ok(())
     }
@@ -478,6 +501,19 @@ mod tests {
     }
 
     #[test]
+    fn midi_program_mapping_round_trips_builtin_oscillators() {
+        for instrument in Instrument::all() {
+            assert_eq!(
+                Instrument::from_midi_program(instrument.midi_program()),
+                instrument
+            );
+        }
+        assert_eq!(Instrument::from_midi_program(40), Instrument::Saw);
+        assert_eq!(Instrument::from_midi_program(8), Instrument::Noise);
+        assert_eq!(Instrument::from_midi_program(9), Instrument::Noise);
+    }
+
+    #[test]
     fn out_of_bounds_notes_are_refused() {
         let valid = Note {
             id: 1,
@@ -516,6 +552,16 @@ mod tests {
             },
             Note {
                 velocity: f32::NAN,
+                ..valid
+            },
+            Note {
+                start_beat: MAX_BEAT_POSITION,
+                length_beats: 1.0,
+                ..valid
+            },
+            Note {
+                start_beat: f64::MAX,
+                length_beats: f64::MAX,
                 ..valid
             },
         ];
